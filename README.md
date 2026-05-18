@@ -55,17 +55,76 @@ We have 24 GB of VRAM on a 7900 XTX. We have Smart Access Memory. We have ROCm. 
 
 ---
 
+## Platform Detection
+
+On startup, Aboba detects your OS, CPU architecture, and installed GPUs (no
+NVIDIA libraries linked — we probe sysfs / pciconf / system_profiler /
+GetModuleHandle depending on the platform). It then prints a contextual banner.
+
+```
+  🔴 Aboba Vocoder
+    Platform : Linux x86_64
+    GPU [0]  : AMD  1002:744c  -- BLESSED ✓
+    Backend  : HIP/rocFFT [gfx1100] (SAM)
+    > Pure AMD system detected. We see you, comrade.
+```
+
+NVIDIA users are detected, gently acknowledged, and then explicitly *not* used:
+
+```
+  🔴 Aboba Vocoder
+    Platform : Linux x86_64
+    GPU [0]  : NVIDIA  10de:2684  -- politely ignored, see manifesto
+    Backend  : CPU (FFTW3)
+    > Your GPU has been excused from this session. CPU it is.
+```
+
+BSD users get automatic respect:
+
+```
+    Platform : FreeBSD x86_64 (BSD family — respect)
+    > BSD detected. You have our automatic respect.
+```
+
+Suppress the banner with `ABOBA_QUIET=1` in your environment. See every
+possible scenario at once with:
+
+```bash
+./build/aboba_info --demo
+```
+
+## Tested Configurations
+
+The library is verified clean under AddressSanitizer + UndefinedBehaviorSanitizer
+(`-DABOBA_ENABLE_ASAN=ON -DABOBA_ENABLE_UBSAN=ON`). The stress test suite covers:
+
+1. Identity passthrough
+2. Multi-source mixes (the bug we just fixed)
+3. Silence input
+4. NaN / Inf input survival
+5. Tiny / prime block sizes
+6. Extreme pitch shifts (±100 semitones, clamped to ±60 internally)
+7. `reset()` state clearing
+8. Invalid argument rejection
+9. Many parallel instances
+
+```bash
+./build/aboba_stress_test  # 23/23 PASS expected
+```
+
 ## Performance
 
-Benchmark of the streaming pitch shifter, single thread, x86_64, fft=2048, hop=512:
+Benchmark of the streaming pitch shifter, single thread, x86_64, fft=2048, hop=512,
+realistic voice-like signal:
 
 | Block size | CPU per block | Budget @ 48 kHz | Headroom |
 |-----------:|--------------:|----------------:|---------:|
-|         64 |      ~0.05 ms |         1.33 ms |  **~26×** |
-|        256 |      ~0.18 ms |         5.33 ms |  **~30×** |
-|       1024 |      ~0.65 ms |        21.33 ms |  **~33×** |
+|         64 |        ~12 µs |         1.33 ms | **~110×** |
+|        256 |        ~46 µs |         5.33 ms | **~115×** |
+|       1024 |       ~180 µs |        21.33 ms | **~118×** |
 
-Translation for non-DSP people: this software uses **3% of one CPU core** to do what every YouTube tutorial says you need a $1600 graphics card for.
+Translation for non-DSP people: this software uses **under 1% of one CPU core**
+to do what every YouTube tutorial says you need a $1600 graphics card for.
 
 ---
 
@@ -185,6 +244,16 @@ The whole thing is structured so that adding a new backend is one file. Want a V
 ---
 
 ## FAQ
+
+**Q: How does it know I have an NVIDIA card?**
+A: On Linux we read `/sys/bus/pci/devices/*/vendor` (no NVIDIA libs linked, no
+proprietary calls). On BSD we parse `pciconf -l`. On macOS we ask
+`system_profiler`. On Windows we check whether `nvcuda.dll` is loadable. The
+detection has zero NVIDIA dependencies — we just notice you're there, smile,
+and move on.
+
+**Q: Can I disable the banner?**
+A: `export ABOBA_QUIET=1`. We'll never know.
 
 **Q: What does "Aboba" mean?**
 A: Aboba.

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "aboba/backend.hpp"
+#include "aboba/platform.hpp"
 
 #include <cstdio>
 #include <stdexcept>
@@ -28,22 +29,26 @@ std::unique_ptr<Backend> create_backend(BackendType type) {
 }
 
 std::unique_ptr<Backend> create_best_backend() {
-    // Try HIP first. If unavailable (no ROCm at build time, or no AMD GPU at
-    // runtime), fall back to CPU.
-    try {
-        auto hip = make_hip_backend();
-        if (hip) {
+    PlatformInfo info = detect_platform();
+
+    // Try HIP first if there's an AMD GPU. We don't try HIP on NVIDIA-only
+    // systems — that would just print confusing rocFFT errors. CPU it is.
+    if (info.has_amd()) {
+        try {
+            auto hip = make_hip_backend();
+            if (hip) {
+                print_platform_banner(info, hip->name());
+                return hip;
+            }
+        } catch (const std::exception& e) {
             std::fprintf(stderr,
-                "[aboba] using GPU backend: %s\n", hip->name());
-            return hip;
+                "[aboba] HIP available but init failed (%s), falling back to CPU\n",
+                e.what());
         }
-    } catch (const std::exception& e) {
-        std::fprintf(stderr,
-            "[aboba] HIP unavailable (%s), falling back to CPU\n", e.what());
     }
 
     auto cpu = make_cpu_backend();
-    std::fprintf(stderr, "[aboba] using CPU backend: %s\n", cpu->name());
+    print_platform_banner(info, cpu->name());
     return cpu;
 }
 

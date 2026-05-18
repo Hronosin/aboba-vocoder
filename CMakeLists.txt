@@ -68,6 +68,9 @@ set(ABOBA_SOURCES
     src/stft.cpp
     src/phase_vocoder.cpp
     src/streaming.cpp
+    src/platform.cpp
+    src/health.cpp
+    src/self_check.cpp
     src/backend/cpu_backend.cpp
     src/backend/hip_backend.cpp
     src/backend/factory.cpp
@@ -120,6 +123,15 @@ if (ABOBA_BUILD_EXAMPLES)
 
     add_executable(aboba_stress_test examples/stress_test.cpp)
     target_link_libraries(aboba_stress_test PRIVATE aboba)
+
+    add_executable(aboba_dynamic_test examples/dynamic_test.cpp)
+    target_link_libraries(aboba_dynamic_test PRIVATE aboba)
+    # Threads for the concurrent stats-read test
+    find_package(Threads REQUIRED)
+    target_link_libraries(aboba_dynamic_test PRIVATE Threads::Threads)
+
+    add_executable(aboba_info examples/info.cpp)
+    target_link_libraries(aboba_info PRIVATE aboba)
 
     if (ABOBA_ENABLE_REALTIME)
         add_executable(aboba_realtime_voice examples/realtime_voice.cpp)
