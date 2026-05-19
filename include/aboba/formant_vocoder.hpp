@@ -83,6 +83,19 @@ public:
     void process(const float* input, float* output, std::size_t n_samples);
 
     void set_pitch_semitones(float st);
+
+    // Independent formant shift, in semitones.
+    //   +N semitones -> formants stretched up the spectrum (smaller/younger
+    //                   voice, "anime girl" direction)
+    //   -N semitones -> formants compressed down (larger/older voice,
+    //                   "giant" direction)
+    //   0 (default)  -> formants preserved (anti-helium, classic operation)
+    //
+    // Combined with pitch shift this is the main creative knob: pitch
+    // controls perceived gender/age via fundamental, formants control
+    // perceived body-size/character. They are orthogonal.
+    void set_formant_semitones(float st);
+
     void set_profile(QualityProfile p);
 
     void reset();
@@ -102,7 +115,8 @@ private:
 
     FormantVocoderConfig cfg_;
     Backend*    backend_ = nullptr;
-    float       pitch_ratio_ = 1.0f;
+    float       pitch_ratio_   = 1.0f;
+    float       formant_ratio_ = 1.0f;
     int         cepstral_order_ = 24;
 
     std::size_t n_bins_   = 0;

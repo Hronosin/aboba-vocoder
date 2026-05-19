@@ -20,6 +20,7 @@ endif()
 option(ABOBA_ENABLE_HIP    "Build the HIP/rocFFT GPU backend (requires ROCm)" OFF)
 option(ABOBA_ENABLE_REALTIME "Build the PortAudio-based realtime engine"     ON)
 option(ABOBA_BUILD_EXAMPLES "Build example programs" ON)
+option(ABOBA_BUILD_PYTHON   "Build pybind11 Python bindings (requires Python + pybind11)" OFF)
 option(ABOBA_ENABLE_ASAN   "Build with AddressSanitizer (dev only)"          OFF)
 option(ABOBA_ENABLE_UBSAN  "Build with UndefinedBehaviorSanitizer (dev only)" OFF)
 option(ABOBA_AUTO_ARCH     "Auto-detect CPU features and apply optimal flags" ON)
@@ -93,6 +94,12 @@ set(ABOBA_SOURCES
     src/debug.cpp
     src/yin.cpp
     src/formant_vocoder.cpp
+    src/voice_character.cpp
+    src/musical_scale.cpp
+    src/pitch_corrector.cpp
+    src/voice_config.cpp
+    src/noise_reduction.cpp
+    src/reverb.cpp
     src/pipeline.cpp
     src/backend/cpu_backend.cpp
     src/backend/hip_backend.cpp
@@ -105,6 +112,9 @@ endif()
 
 add_library(aboba STATIC ${ABOBA_SOURCES})
 target_include_directories(aboba PUBLIC include)
+# Always build with -fPIC so the static library can be linked into shared
+# objects (Python bindings, VST3 plugins, etc).
+set_target_properties(aboba PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(aboba
     PUBLIC PkgConfig::FFTW3F
 )
@@ -147,26 +157,32 @@ if (ABOBA_BUILD_EXAMPLES)
     add_executable(aboba_stream_file examples/stream_file.cpp)
     target_link_libraries(aboba_stream_file PRIVATE aboba)
 
-    add_executable(aboba_stress_test examples/stress_test.cpp)
-    target_link_libraries(aboba_stress_test PRIVATE aboba)
+    # Test/example executables use lots of literals and ad-hoc numeric
+    # code that triggers cosmetic warnings (-Wconversion, -Wdouble-promotion,
+    # -Wsign-conversion). The library proper is strict; relax for tests so
+    # we keep the test code readable. This applies ONLY to executables, NOT
+    # to the library code itself.
+    function(aboba_test_executable target src)
+        add_executable(${target} ${src})
+        target_link_libraries(${target} PRIVATE aboba)
+        if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(${target} PRIVATE
+                -Wno-conversion -Wno-sign-conversion
+                -Wno-double-promotion -Wno-old-style-cast
+                -Wno-unused-result -Wno-unused-variable)
+        endif()
+    endfunction()
 
-    add_executable(aboba_dynamic_test examples/dynamic_test.cpp)
-    target_link_libraries(aboba_dynamic_test PRIVATE aboba)
-    # Threads for the concurrent stats-read test
+    aboba_test_executable(aboba_stress_test  examples/stress_test.cpp)
+    aboba_test_executable(aboba_dynamic_test examples/dynamic_test.cpp)
     find_package(Threads REQUIRED)
     target_link_libraries(aboba_dynamic_test PRIVATE Threads::Threads)
+    aboba_test_executable(aboba_quality_test examples/quality_test.cpp)
+    aboba_test_executable(aboba_debug_test   examples/debug_test.cpp)
+    target_link_libraries(aboba_debug_test   PRIVATE Threads::Threads)
 
-    add_executable(aboba_quality_test examples/quality_test.cpp)
-    target_link_libraries(aboba_quality_test PRIVATE aboba)
-
-    add_executable(aboba_debug_test examples/debug_test.cpp)
-    target_link_libraries(aboba_debug_test PRIVATE aboba Threads::Threads)
-
-    add_executable(aboba_inspect examples/inspect.cpp)
-    target_link_libraries(aboba_inspect PRIVATE aboba)
-
-    add_executable(aboba_info examples/info.cpp)
-    target_link_libraries(aboba_info PRIVATE aboba)
+    aboba_test_executable(aboba_inspect examples/inspect.cpp)
+    aboba_test_executable(aboba_info    examples/info.cpp)
 
     if (ABOBA_ENABLE_REALTIME)
         add_executable(aboba_realtime_voice examples/realtime_voice.cpp)
@@ -179,3 +195,36 @@ install(TARGETS aboba
         ARCHIVE DESTINATION lib
         LIBRARY DESTINATION lib)
 install(DIRECTORY include/aboba DESTINATION include)
+
+# --- Python bindings -------------------------------------------------------
+if (ABOBA_BUILD_PYTHON)
+    find_package(Python 3.8 REQUIRED COMPONENTS Interpreter Development.Module)
+    find_package(pybind11 CONFIG QUIET)
+    if (NOT pybind11_FOUND)
+        # Fall back to scripts shipped with the pip-installed package.
+        execute_process(
+            COMMAND ${Python_EXECUTABLE} -c "import pybind11; print(pybind11.get_cmake_dir())"
+            OUTPUT_VARIABLE PYBIND11_CMAKE_DIR
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if (PYBIND11_CMAKE_DIR)
+            set(pybind11_DIR ${PYBIND11_CMAKE_DIR})
+            find_package(pybind11 CONFIG REQUIRED)
+        else()
+            message(FATAL_ERROR
+                "ABOBA_BUILD_PYTHON=ON but pybind11 not found. "
+                "Install: pip install pybind11")
+        endif()
+    endif()
+
+    pybind11_add_module(aboba_py python/aboba_py.cpp)
+    target_link_libraries(aboba_py PRIVATE aboba)
+    set_target_properties(aboba_py PROPERTIES OUTPUT_NAME "aboba")
+    # Relax warning level for binding code — pybind generates lots of
+    # type promotions that aren't worth chasing.
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(aboba_py PRIVATE
+            -Wno-conversion -Wno-sign-conversion
+            -Wno-double-promotion -Wno-old-style-cast
+            -Wno-unused-parameter)
+    endif()
+endif()

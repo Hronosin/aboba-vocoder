@@ -130,6 +130,16 @@ void FormantVocoder::set_pitch_semitones(float st) {
     pitch_ratio_ = std::pow(2.0f, st / 12.0f);
 }
 
+void FormantVocoder::set_formant_semitones(float st) {
+    // Use a tighter clamp than pitch — extreme formant shifts (beyond ~24
+    // semitones, i.e. 4x) make the envelope alias against the FFT bin grid.
+    constexpr float kFormantMax = 24.0f;
+    if (!std::isfinite(st)) st = 0.0f;
+    if (st >  kFormantMax) st =  kFormantMax;
+    if (st < -kFormantMax) st = -kFormantMax;
+    formant_ratio_ = std::pow(2.0f, st / 12.0f);
+}
+
 void FormantVocoder::set_profile(QualityProfile p) {
     cfg_.profile = p;
     cepstral_order_ = (cfg_.cepstral_order_override > 0)
@@ -331,9 +341,40 @@ void FormantVocoder::apply_pitch_shift_with_envelope() {
         }
     }
 
-    // 3. Re-apply the ORIGINAL envelope (still at bin k, NOT shifted)
-    for (std::size_t k = 0; k < n_bins_; ++k) {
-        syn_magn_[k] *= envelope_[k];
+    // 3. Re-apply the envelope, scaled by formant_ratio_.
+    //
+    // For formant_ratio_ != 1.0 we sample the original envelope at a
+    // scaled index: out_bin k uses envelope at index k / formant_ratio_.
+    //   formant_ratio_ > 1  -> sample at lower indices -> envelope contour
+    //                          stretches upward in frequency -> formants
+    //                          appear higher (smaller / younger voice)
+    //   formant_ratio_ < 1  -> sample at higher indices -> envelope
+    //                          contour compresses downward in frequency
+    //                          -> formants appear lower (bigger / older
+    //                          voice)
+    //
+    // Linear interpolation between adjacent envelope bins keeps the result
+    // smooth and avoids stairstep artifacts.
+    if (std::fabs(formant_ratio_ - 1.0f) < 1e-6f) {
+        for (std::size_t k = 0; k < n_bins_; ++k) {
+            syn_magn_[k] *= envelope_[k];
+        }
+    } else {
+        const float inv = 1.0f / formant_ratio_;
+        const float max_idx = static_cast<float>(n_bins_ - 1);
+        for (std::size_t k = 0; k < n_bins_; ++k) {
+            float src = static_cast<float>(k) * inv;
+            // Clamp to envelope domain. Above the highest bin we'd be
+            // extrapolating into nothing — pin to the last value (rolls off
+            // naturally because the high bins have small envelope values).
+            if (src < 0.0f) src = 0.0f;
+            if (src > max_idx) src = max_idx;
+            const std::size_t i0 = static_cast<std::size_t>(src);
+            const std::size_t i1 = std::min<std::size_t>(i0 + 1, n_bins_ - 1);
+            const float t = src - static_cast<float>(i0);
+            const float e = envelope_[i0] * (1.0f - t) + envelope_[i1] * t;
+            syn_magn_[k] *= e;
+        }
     }
 }
 
@@ -457,7 +498,7 @@ void FormantVocoder::process(const float* input, float* output, std::size_t n_sa
                     std::memmove(out_buf_.data(),
                                  out_buf_.data() + out_read_,
                                  active * sizeof(float));
-                    std::fill(out_buf_.begin() + active, out_buf_.end(), 0.0f);
+                    std::fill(out_buf_.begin() + static_cast<std::ptrdiff_t>(active), out_buf_.end(), 0.0f);
                     out_write_ -= out_read_;
                     out_read_   = 0;
                 }
@@ -495,7 +536,7 @@ void FormantVocoder::process(const float* input, float* output, std::size_t n_sa
                          out_buf_.data() + out_read_,
                          active * sizeof(float));
         }
-        std::fill(out_buf_.begin() + active, out_buf_.end(), 0.0f);
+        std::fill(out_buf_.begin() + static_cast<std::ptrdiff_t>(active), out_buf_.end(), 0.0f);
         out_write_ -= out_read_;
         out_read_   = 0;
     }

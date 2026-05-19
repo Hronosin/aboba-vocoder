@@ -77,19 +77,19 @@ bool read_wav(const std::string& path, std::vector<float>& out, double& sr) {
     out.resize(n_samples);
     if (fmt == 0x0003 && bps == 32) {
         std::vector<float> raw(n_samples * ch);
-        std::fread(raw.data(), sizeof(float), raw.size(), f);
+        (void)std::fread(raw.data(), sizeof(float), raw.size(), f);
         // Downmix to mono
         for (std::size_t i = 0; i < n_samples; ++i) {
             float s = 0;
-            for (int c = 0; c < ch; ++c) s += raw[i*ch + c];
-            out[i] = s / ch;
+            for (int c = 0; c < ch; ++c) s += raw[i*static_cast<std::size_t>(ch) + static_cast<std::size_t>(c)];
+            out[i] = s / static_cast<float>(ch);
         }
     } else if (fmt == 0x0001 && bps == 16) {
-        std::vector<std::int16_t> raw(n_samples * ch);
-        std::fread(raw.data(), sizeof(std::int16_t), raw.size(), f);
+        std::vector<std::int16_t> raw(n_samples * static_cast<std::size_t>(ch));
+        (void)std::fread(raw.data(), sizeof(std::int16_t), raw.size(), f);
         for (std::size_t i = 0; i < n_samples; ++i) {
             int sum = 0;
-            for (int c = 0; c < ch; ++c) sum += raw[i*ch + c];
+            for (int c = 0; c < ch; ++c) sum += raw[i*static_cast<std::size_t>(ch) + static_cast<std::size_t>(c)];
             out[i] = static_cast<float>(sum) / static_cast<float>(ch) / 32768.0f;
         }
     } else {
@@ -117,9 +117,10 @@ void cmd_benchmark(aboba::QualityProfile prof) {
     // Voice-like signal
     const float harmonics[] = {1.0f, 0.6f, 0.4f, 0.25f, 0.15f, 0.1f};
     for (int h = 0; h < 6; ++h) {
-        const float hz = 180.0f * (h + 1);
+        const float hz = 180.0f * static_cast<float>(h + 1);
         for (int i = 0; i < N; ++i) {
-            in[i] += 0.15f * harmonics[h] * std::sin(2.0f*kPi*hz*i/sr);
+            in[static_cast<std::size_t>(i)] += 0.15f * harmonics[h] *
+                std::sin(2.0f*kPi*hz*static_cast<float>(i)/static_cast<float>(sr));
         }
     }
 
@@ -182,7 +183,7 @@ void cmd_process_file(const std::string& path, aboba::QualityProfile prof,
         return;
     }
     std::cout << "Loaded " << in.size() << " samples at "
-              << sr << " Hz (" << in.size()/sr << " sec)\n";
+              << sr << " Hz (" << (static_cast<double>(in.size())/sr) << " sec)\n";
 
     auto backend = create_best_backend();
 
@@ -288,13 +289,14 @@ void cmd_process_file(const std::string& path, aboba::QualityProfile prof,
     auto vstats = voc.stats();
     std::cout << "\n=== Vocoder internals ===\n";
     std::printf("frames: total=%llu voiced=%llu unvoiced=%llu silent=%llu degenerate=%llu\n",
-                (unsigned long long)vstats.frames_total,
-                (unsigned long long)vstats.frames_voiced,
-                (unsigned long long)vstats.frames_unvoiced,
-                (unsigned long long)vstats.frames_silent,
-                (unsigned long long)vstats.frames_degenerate);
+                static_cast<unsigned long long>(vstats.frames_total),
+                static_cast<unsigned long long>(vstats.frames_voiced),
+                static_cast<unsigned long long>(vstats.frames_unvoiced),
+                static_cast<unsigned long long>(vstats.frames_silent),
+                static_cast<unsigned long long>(vstats.frames_degenerate));
     std::printf("last F0: %.1f Hz, aperiodicity: %.3f\n",
-                (double)vstats.last_f0_hz, (double)vstats.last_aperiodicity);
+                static_cast<double>(vstats.last_f0_hz),
+                static_cast<double>(vstats.last_aperiodicity));
 }
 
 void print_usage(const char* argv0) {
