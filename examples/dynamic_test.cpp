@@ -314,10 +314,33 @@ int main() {
 
         // The p99 check is the algorithmic one — it should always pass on
         // sane hardware. max can spike due to OS jitter unrelated to us.
-        check(r.p99_us < r.budget_us / 2,
-              "real vocoder p99 fits in half the budget (algorithmic perf)");
-        std::printf("    (vocoder p99=%uus, max=%uus, budget=%uus, reason=%s)\n",
-                    r.p99_us, r.max_us, r.budget_us, r.reason);
+        //
+        // Under sanitizers (ASan/UBSan) the same code runs 3-5x slower because
+        // of shadow-memory checks and trap insertion on every load/store. The
+        // budget check is about whether the actual production binary will hit
+        // its deadline, so we relax substantially when sanitizers are active.
+#if defined(__SANITIZE_ADDRESS__) || defined(__has_feature)
+#  if defined(__has_feature)
+#    if __has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer)
+#      define ABOBA_UNDER_SAN 1
+#    endif
+#  endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) && !defined(ABOBA_UNDER_SAN)
+#  define ABOBA_UNDER_SAN 1
+#endif
+#if !defined(ABOBA_UNDER_SAN)
+#  define ABOBA_UNDER_SAN 0
+#endif
+        const unsigned bound = ABOBA_UNDER_SAN
+            ? r.budget_us * 6u    // generous slack under instrumentation
+            : r.budget_us / 2u;   // strict in production builds
+        check(r.p99_us < bound,
+              "real vocoder p99 fits in budget (algorithmic perf)");
+        std::printf("    (vocoder p99=%uus, max=%uus, budget=%uus, "
+                    "sanitizer=%s, reason=%s)\n",
+                    r.p99_us, r.max_us, r.budget_us,
+                    ABOBA_UNDER_SAN ? "yes" : "no", r.reason);
 
         // Now run it for a while under HealthMonitor and verify no false trips
         voc.reset();

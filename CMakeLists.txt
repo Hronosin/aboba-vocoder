@@ -22,7 +22,18 @@ option(ABOBA_ENABLE_REALTIME "Build the PortAudio-based realtime engine"     ON)
 option(ABOBA_BUILD_EXAMPLES "Build example programs" ON)
 option(ABOBA_ENABLE_ASAN   "Build with AddressSanitizer (dev only)"          OFF)
 option(ABOBA_ENABLE_UBSAN  "Build with UndefinedBehaviorSanitizer (dev only)" OFF)
-option(ABOBA_NATIVE_ARCH   "Use -march=native for max SIMD throughput"       OFF)
+option(ABOBA_AUTO_ARCH     "Auto-detect CPU features and apply optimal flags" ON)
+option(ABOBA_NATIVE_ARCH   "(legacy) Force -march=native; implied by ABOBA_AUTO_ARCH" OFF)
+
+# --- Arch detection --------------------------------------------------------
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(AbobaArch)
+
+if (ABOBA_AUTO_ARCH)
+    aboba_detect_cpu()
+    aboba_detect_amd_gpus(ABOBA_AMD_GPU_TARGETS)
+    aboba_print_detection_report()
+endif()
 
 # --- Sanitizers ------------------------------------------------------------
 if (ABOBA_ENABLE_ASAN)
@@ -44,12 +55,19 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         -Woverloaded-virtual -Wdouble-promotion
         -Wformat=2
     )
-    if (ABOBA_NATIVE_ARCH)
+    if (ABOBA_AUTO_ARCH AND DEFINED ABOBA_CPU_FLAGS)
+        add_compile_options(${ABOBA_CPU_FLAGS})
+    elseif (ABOBA_NATIVE_ARCH)
         add_compile_options(-march=native)
     endif()
-    # Audio loops benefit from these in Release.
-    add_compile_options($<$<CONFIG:Release>:-ffast-math>
-                       $<$<CONFIG:Release>:-funroll-loops>)
+    # Release optimizations — SAFE subset only. We rely on std::isfinite()
+    # everywhere, so we must NOT enable -ffast-math (which implies
+    # -ffinite-math-only and lets the compiler delete those checks).
+    add_compile_options(
+        $<$<CONFIG:Release>:-funroll-loops>
+        $<$<CONFIG:Release>:-fno-math-errno>
+        $<$<CONFIG:Release>:-fno-trapping-math>
+    )
 endif()
 
 # --- Dependencies ----------------------------------------------------------
@@ -71,6 +89,11 @@ set(ABOBA_SOURCES
     src/platform.cpp
     src/health.cpp
     src/self_check.cpp
+    src/sysinfo.cpp
+    src/debug.cpp
+    src/yin.cpp
+    src/formant_vocoder.cpp
+    src/pipeline.cpp
     src/backend/cpu_backend.cpp
     src/backend/hip_backend.cpp
     src/backend/factory.cpp
@@ -85,12 +108,15 @@ target_include_directories(aboba PUBLIC include)
 target_link_libraries(aboba
     PUBLIC PkgConfig::FFTW3F
 )
+target_compile_definitions(aboba PUBLIC
+    ABOBA_VERSION_STRING="${PROJECT_VERSION}"
+)
 if (FFTW3F_THREADS_LIB)
     target_link_libraries(aboba PUBLIC ${FFTW3F_THREADS_LIB})
 endif()
 if (ABOBA_ENABLE_REALTIME)
     target_link_libraries(aboba PUBLIC PkgConfig::PORTAUDIO)
-    target_compile_definitions(aboba PUBLIC ABOBA_ENABLE_REALTIME=1)
+    target_compile_definitions(aboba PUBLIC ABOBA_ENABLE_REALTIME=1 ABOBA_HAS_REALTIME=1)
 endif()
 
 # --- HIP backend (optional) ------------------------------------------------
@@ -104,7 +130,7 @@ if (ABOBA_ENABLE_HIP)
     find_package(hip     REQUIRED CONFIG)
     find_package(rocfft  REQUIRED CONFIG)
 
-    target_compile_definitions(aboba PUBLIC ABOBA_ENABLE_HIP=1)
+    target_compile_definitions(aboba PUBLIC ABOBA_ENABLE_HIP=1 ABOBA_HAS_HIP=1)
     target_link_libraries(aboba PUBLIC hip::host roc::rocfft)
 
     message(STATUS "Aboba: HIP backend ENABLED (ROCm at ${ROCM_PATH})")
@@ -129,6 +155,15 @@ if (ABOBA_BUILD_EXAMPLES)
     # Threads for the concurrent stats-read test
     find_package(Threads REQUIRED)
     target_link_libraries(aboba_dynamic_test PRIVATE Threads::Threads)
+
+    add_executable(aboba_quality_test examples/quality_test.cpp)
+    target_link_libraries(aboba_quality_test PRIVATE aboba)
+
+    add_executable(aboba_debug_test examples/debug_test.cpp)
+    target_link_libraries(aboba_debug_test PRIVATE aboba Threads::Threads)
+
+    add_executable(aboba_inspect examples/inspect.cpp)
+    target_link_libraries(aboba_inspect PRIVATE aboba)
 
     add_executable(aboba_info examples/info.cpp)
     target_link_libraries(aboba_info PRIVATE aboba)

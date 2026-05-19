@@ -99,9 +99,12 @@ StreamingPhaseVocoder::StreamingPhaseVocoder(std::size_t fft_size,
 
     float sum_w2 = 0.0f;
     for (float w : window_) sum_w2 += w * w;
-    const float frames_per_input_sample =
-        static_cast<float>(fft_size_) / static_cast<float>(hop_size_);
-    ola_norm_ = sum_w2 / frames_per_input_sample;
+    // COLA² gain for the OLA reconstruction: sum_w² / hop_size.
+    // Derivation: with N-tap window stepped by hop, each output sample
+    // receives ~N/hop overlapping windowed-and-squared contributions whose
+    // sum, by the COLA² property, equals sum_w² / hop. The iFFT scale then
+    // becomes 1/(fft_size * ola_norm) so identity passthrough is unity.
+    ola_norm_ = sum_w2 / static_cast<float>(hop_size_);
     if (ola_norm_ < 1e-20f) ola_norm_ = 1.0f;  // paranoia
 }
 
