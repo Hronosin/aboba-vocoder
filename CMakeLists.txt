@@ -98,6 +98,8 @@ set(ABOBA_SOURCES
     src/musical_scale.cpp
     src/pitch_corrector.cpp
     src/voice_config.cpp
+    src/mock_backend.cpp
+    src/hybrid_backend.cpp
     src/noise_reduction.cpp
     src/reverb.cpp
     src/pipeline.cpp
@@ -180,6 +182,9 @@ if (ABOBA_BUILD_EXAMPLES)
     aboba_test_executable(aboba_quality_test examples/quality_test.cpp)
     aboba_test_executable(aboba_debug_test   examples/debug_test.cpp)
     target_link_libraries(aboba_debug_test   PRIVATE Threads::Threads)
+
+    aboba_test_executable(aboba_hybrid_test  examples/hybrid_test.cpp)
+    target_link_libraries(aboba_hybrid_test  PRIVATE Threads::Threads)
 
     aboba_test_executable(aboba_inspect examples/inspect.cpp)
     aboba_test_executable(aboba_info    examples/info.cpp)
