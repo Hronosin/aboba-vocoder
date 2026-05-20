@@ -1,0 +1,62 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// fft_stage.comp — single Cooley-Tukey radix-2 DIT stage (in-place).
+//
+// Input: complex array `buf[N]` with bit-reversal permutation ALREADY
+// applied (host runs bitrev_permute.comp once before the first stage).
+//
+// Algorithm:
+//   Stage `s` (0-indexed) processes butterflies of size m=2^(s+1).
+//   Each butterfly:
+//     pair_idx = thread_id / (m/2)   -> which butterfly within the array
+//     k        = thread_id % (m/2)   -> position within the butterfly
+//     i = pair_idx * m + k
+//     j = i + m/2
+//     w = exp(-2*pi*i*k/m * direction)
+//     u = buf[i]
+//     t = w * buf[j]
+//     buf[i] = u + t
+//     buf[j] = u - t
+//
+// This is IN-PLACE; we use a single buffer (no ping-pong). The data is
+// at binding 0 with read+write access.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer Buf { vec2 buf[]; };
+
+layout(push_constant) uniform PC {
+    uint n;          // total size (power of 2)
+    uint m_half;     // m/2 for this stage, where m = 2^(stage+1)
+    int  direction;  // +1 forward, -1 inverse
+    uint _pad;
+} pc;
+
+vec2 cmul(vec2 a, vec2 b) {
+    return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint half_n = pc.n >> 1;
+    if (tid >= half_n) return;
+
+    uint m_half = pc.m_half;
+    uint m = m_half << 1;
+
+    uint pair_idx = tid / m_half;
+    uint k        = tid % m_half;
+    uint i        = pair_idx * m + k;
+    uint j        = i + m_half;
+
+    float phase = -float(pc.direction) * 6.28318530717958647692 *
+                   float(k) / float(m);
+    vec2 w = vec2(cos(phase), sin(phase));
+
+    vec2 u = buf[i];
+    vec2 t = cmul(w, buf[j]);
+
+    buf[i] = u + t;
+    buf[j] = u - t;
+}

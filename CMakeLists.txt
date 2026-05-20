@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.21)
 project(aboba_vocoder
     VERSION 0.1.0
     DESCRIPTION "AMD-exclusive vocoder framework. Aboba."
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 set(CMAKE_CXX_STANDARD 17)
@@ -18,9 +18,12 @@ endif()
 
 # --- Options ---------------------------------------------------------------
 option(ABOBA_ENABLE_HIP    "Build the HIP/rocFFT GPU backend (requires ROCm)" OFF)
+option(ABOBA_ENABLE_VULKAN "Build the Vulkan compute backend (cross-vendor GPU)" OFF)
 option(ABOBA_ENABLE_REALTIME "Build the PortAudio-based realtime engine"     ON)
 option(ABOBA_BUILD_EXAMPLES "Build example programs" ON)
 option(ABOBA_BUILD_PYTHON   "Build pybind11 Python bindings (requires Python + pybind11)" OFF)
+option(ABOBA_BUILD_SHARED_C "Build aboba_c shared library (for game-engine / FFI integration)" ON)
+option(ABOBA_BUILD_VST3    "Build VST3 plugin (requires VST3 SDK)" OFF)
 option(ABOBA_ENABLE_ASAN   "Build with AddressSanitizer (dev only)"          OFF)
 option(ABOBA_ENABLE_UBSAN  "Build with UndefinedBehaviorSanitizer (dev only)" OFF)
 option(ABOBA_AUTO_ARCH     "Auto-detect CPU features and apply optimal flags" ON)
@@ -98,6 +101,7 @@ set(ABOBA_SOURCES
     src/musical_scale.cpp
     src/pitch_corrector.cpp
     src/voice_config.cpp
+    src/lowlatency.cpp
     src/mock_backend.cpp
     src/hybrid_backend.cpp
     src/noise_reduction.cpp
@@ -116,7 +120,14 @@ add_library(aboba STATIC ${ABOBA_SOURCES})
 target_include_directories(aboba PUBLIC include)
 # Always build with -fPIC so the static library can be linked into shared
 # objects (Python bindings, VST3 plugins, etc).
-set_target_properties(aboba PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(aboba PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    # Hide symbols by default so the C-ABI shared library doesn't leak
+    # C++ mangled names. Symbols intended for export are tagged via
+    # ABOBA_API (default visibility attribute).
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
 target_link_libraries(aboba
     PUBLIC PkgConfig::FFTW3F
 )
@@ -149,6 +160,22 @@ if (ABOBA_ENABLE_HIP)
 else()
     message(STATUS "Aboba: HIP backend disabled (CPU-only build). "
                     "Pass -DABOBA_ENABLE_HIP=ON to enable.")
+endif()
+
+# --- Vulkan backend --------------------------------------------------------
+if (ABOBA_ENABLE_VULKAN)
+    find_package(Vulkan REQUIRED)
+
+    target_sources(aboba PRIVATE src/vulkan_backend.cpp)
+    target_compile_definitions(aboba PUBLIC ABOBA_ENABLE_VULKAN=1 ABOBA_HAS_VULKAN=1)
+    target_link_libraries(aboba PUBLIC Vulkan::Vulkan)
+    # SPIR-V headers are in src/vulkan_shaders_gen/
+    target_include_directories(aboba PRIVATE src)
+
+    message(STATUS "Aboba: Vulkan backend ENABLED")
+else()
+    message(STATUS "Aboba: Vulkan backend disabled. "
+                    "Pass -DABOBA_ENABLE_VULKAN=ON to enable.")
 endif()
 
 # --- Examples --------------------------------------------------------------
@@ -186,6 +213,28 @@ if (ABOBA_BUILD_EXAMPLES)
     aboba_test_executable(aboba_hybrid_test  examples/hybrid_test.cpp)
     target_link_libraries(aboba_hybrid_test  PRIVATE Threads::Threads)
 
+    if (ABOBA_ENABLE_VULKAN)
+        aboba_test_executable(aboba_vulkan_test examples/vulkan_test.cpp)
+    endif()
+
+    # Pure C test of the C ABI. Built as C, linked against the shared
+    # libaboba_c only — verifies that the ABI surface is truly C-callable.
+    if (ABOBA_BUILD_SHARED_C)
+        add_executable(aboba_c_abi_test examples/c_abi_test.c)
+        # IMPORTANT: this test compiles as C, links against the C ABI
+        # shared library, and has NO direct dependency on the C++ static
+        # library. That ensures we're testing the actual ABI boundary.
+        set_target_properties(aboba_c_abi_test PROPERTIES
+            C_STANDARD 99 C_STANDARD_REQUIRED ON LINKER_LANGUAGE C)
+        target_link_libraries(aboba_c_abi_test PRIVATE aboba_c m)
+        target_include_directories(aboba_c_abi_test PRIVATE include)
+        if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(aboba_c_abi_test PRIVATE
+                -Wall -Wextra -Wpedantic
+                -Wno-unused-result)
+        endif()
+    endif()
+
     aboba_test_executable(aboba_inspect examples/inspect.cpp)
     aboba_test_executable(aboba_info    examples/info.cpp)
 
@@ -193,6 +242,38 @@ if (ABOBA_BUILD_EXAMPLES)
         add_executable(aboba_realtime_voice examples/realtime_voice.cpp)
         target_link_libraries(aboba_realtime_voice PRIVATE aboba)
     endif()
+endif()
+
+
+if (ABOBA_BUILD_SHARED_C)
+    # The shared C-ABI library. This is what game engines and other
+    # languages link against via dlopen / LoadLibrary / dotnet / etc.
+    #
+    # Why static linkage of the C++ library inside:
+    #   We bundle libaboba.a (PIC) into this .so so the C-ABI .so is
+    #   fully self-contained — engine integrators don't need to ship
+    #   libaboba.a separately.
+    add_library(aboba_c SHARED
+        src/aboba_c.cpp
+    )
+    target_link_libraries(aboba_c PRIVATE aboba)
+    target_include_directories(aboba_c PUBLIC include)
+
+    # Default visibility hidden — we control what's exported via ABOBA_API.
+    set_target_properties(aboba_c PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        OUTPUT_NAME "aboba_c")
+
+    # Compatibility: define ABOBA_C_BUILDING when compiling this .cpp so
+    # the ABOBA_API macro resolves to dllexport on Windows.
+    target_compile_definitions(aboba_c PRIVATE ABOBA_C_BUILDING)
+
+    install(TARGETS aboba_c
+            ARCHIVE DESTINATION lib
+            LIBRARY DESTINATION lib
+            RUNTIME DESTINATION bin)
+    install(FILES include/aboba_c.h DESTINATION include)
 endif()
 
 # --- Install ---------------------------------------------------------------
@@ -232,4 +313,9 @@ if (ABOBA_BUILD_PYTHON)
             -Wno-double-promotion -Wno-old-style-cast
             -Wno-unused-parameter)
     endif()
+endif()
+
+# --- VST3 plugin -----------------------------------------------------------
+if (ABOBA_BUILD_VST3)
+    add_subdirectory(vst3_wrapper)
 endif()

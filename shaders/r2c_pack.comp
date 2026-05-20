@@ -1,0 +1,27 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// r2c_pack.comp
+//
+// Pack a real-valued input array into a complex array (zero imaginary).
+// One thread per output sample. Subsequent stages run the standard
+// complex FFT, then r2c_finish unpacks the result.
+//
+// We chose this naive approach over the more elaborate "compute as N/2
+// complex FFT then post-process" because:
+//   * Our N is small (256-4096)
+//   * Simpler code, smaller surface for bugs
+//   * Easy to verify against CPU FFTW reference
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer In  { float in_buf[]; };
+layout(std430, binding = 1) writeonly buffer Out { vec2 out_buf[]; };
+
+layout(push_constant) uniform PC { uint n; } pc;
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= pc.n) return;
+    out_buf[k] = vec2(in_buf[k], 0.0);
+}

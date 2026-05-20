@@ -1,0 +1,25 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// c2r_finish.comp
+//
+// Take the real part of a complex array. Used after the inverse FFT to
+// produce a real-valued output. The Hermitian symmetry guarantees the
+// imaginary part is zero up to FP noise.
+//
+// Note: we do NOT divide by N here. FFTW's c2r is also unscaled — caller
+// applies the 1/N. The aboba CPU and HIP backends are consistent with
+// this, so we match.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer In  { vec2 in_buf[]; };
+layout(std430, binding = 1) writeonly buffer Out { float out_buf[]; };
+
+layout(push_constant) uniform PC { uint n; } pc;
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= pc.n) return;
+    out_buf[k] = in_buf[k].x;
+}

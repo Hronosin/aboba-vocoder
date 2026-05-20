@@ -1,0 +1,39 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// bitrev_permute.comp
+//
+// Bit-reverse the indices of a complex array. Required as the FIRST step
+// of the in-place Cooley-Tukey FFT (DIT variant).
+//
+// We read from `src` and write to `dst` (separate buffers to avoid race
+// conditions). The host then uses `dst` as the input to the FFT stages.
+//
+// `log2_n` is the number of bits we reverse, computed on the host.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Src { vec2 src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { vec2 dst[]; };
+
+layout(push_constant) uniform PC {
+    uint n;
+    uint log2_n;
+} pc;
+
+uint bit_reverse(uint x, uint bits) {
+    // Standard 32-bit reverse, then shift right.
+    x = ((x & 0xAAAAAAAAu) >> 1) | ((x & 0x55555555u) << 1);
+    x = ((x & 0xCCCCCCCCu) >> 2) | ((x & 0x33333333u) << 2);
+    x = ((x & 0xF0F0F0F0u) >> 4) | ((x & 0x0F0F0F0Fu) << 4);
+    x = ((x & 0xFF00FF00u) >> 8) | ((x & 0x00FF00FFu) << 8);
+    x = (x >> 16) | (x << 16);
+    return x >> (32u - bits);
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint j = bit_reverse(i, pc.log2_n);
+    dst[i] = src[j];
+}
