@@ -167,6 +167,13 @@ private:
     std::size_t        out_write_ = 0;
     float              sola_phase_ = 0.0f;  // fractional read pointer
 
+    // Pre-allocated scratch buffers used during process() — these are
+    // sized at construction and may be grown by process() if the caller
+    // passes a block bigger than expected. ALL allocations happen on
+    // construction or first oversized block; we never reallocate mid-block.
+    std::vector<float> sola_input_scratch_;
+    std::vector<float> probe_output_scratch_;
+
     // Watchdog
     BypassPolicy bypass_policy_ = BypassPolicy::Bypass;
     int          recovery_count_ = 0;

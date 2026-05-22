@@ -434,6 +434,16 @@ VoiceConfigResult parse_voice_config(const std::string& toml_text,
     (void)source_label;
     VoiceConfigResult result;
 
+    // Paranoia: same cap as load_voice_config. Catches in-process callers
+    // that pass adversarial input directly.
+    constexpr std::size_t kMaxConfigBytes = 1 * 1024 * 1024;
+    if (toml_text.size() > kMaxConfigBytes) {
+        result.error = "config text too large (>" +
+            std::to_string(kMaxConfigBytes) + " bytes)";
+        result.line_number = 0;
+        return result;
+    }
+
     SectionMap sections;
     ParseError perr;
     if (!parse_toml(toml_text, sections, perr)) {
@@ -595,9 +605,26 @@ VoiceConfigResult load_voice_config(const std::string& path) {
         result.error = "cannot open file: " + path;
         return result;
     }
-    std::stringstream buf;
-    buf << f.rdbuf();
-    return parse_voice_config(buf.str(), path);
+    // Paranoia: cap file size. Sane TOML configs are well under 100 KiB.
+    // A 1 MiB cap leaves a generous safety margin without exposing us to
+    // gigabyte-sized adversarial input.
+    constexpr std::streamsize kMaxConfigBytes = 1 * 1024 * 1024;
+    f.seekg(0, std::ios::end);
+    const auto sz = f.tellg();
+    f.seekg(0, std::ios::beg);
+    if (sz < 0) {
+        result.error = "cannot determine file size: " + path;
+        return result;
+    }
+    if (sz > kMaxConfigBytes) {
+        result.error = "config file too large (>" +
+            std::to_string(kMaxConfigBytes) + " bytes): " + path;
+        return result;
+    }
+    std::string buf;
+    buf.resize(static_cast<std::size_t>(sz));
+    f.read(buf.data(), sz);
+    return parse_voice_config(buf, path);
 }
 
 std::string serialize_voice_config(const VoiceConfig& cfg) {

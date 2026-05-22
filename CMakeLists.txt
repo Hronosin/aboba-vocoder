@@ -72,6 +72,51 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         $<$<CONFIG:Release>:-fno-math-errno>
         $<$<CONFIG:Release>:-fno-trapping-math>
     )
+
+    # ---- Compiler-level paranoia hardening -------------------------------
+    # These flags exist BECAUSE bugs that slip past code review will
+    # eventually happen. They are belt-and-suspenders defenses, not
+    # primary safety. They cost ~1-3% performance in release builds; we
+    # accept that tradeoff for security and stability.
+    #
+    # -fstack-protector-strong: guard pages on stack frames with arrays/
+    #   variables of size > 8. Detects classic buffer overflows.
+    # -D_FORTIFY_SOURCE=2: enables compile-time + runtime checks on
+    #   strcpy/sprintf/memcpy family. Catches buffer overflows that miss
+    #   the static analyzer.
+    # -fno-strict-aliasing: a few of our SIMD/FFT routines technically
+    #   alias; disabling strict aliasing prevents wrong codegen there.
+    # -fno-delete-null-pointer-checks: in C++ this is mostly benign but
+    #   we don't want the optimizer "proving" our null checks redundant.
+    # -fwrapv: signed integer overflow wraps (defined behavior). We do
+    #   NOT rely on UB for performance anywhere.
+    # -fno-omit-frame-pointer in debug+release for tractable crash logs.
+    add_compile_options(
+        -fstack-protector-strong
+        -fno-strict-aliasing
+        -fno-delete-null-pointer-checks
+        -fwrapv
+        $<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>
+        $<$<CONFIG:Release>:-fno-omit-frame-pointer>
+    )
+    # CFI / shadow-stack on supported toolchains
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag(-fcf-protection=full HAVE_CF_PROTECTION)
+    if (HAVE_CF_PROTECTION)
+        # Control-flow integrity: protects indirect calls/jumps against
+        # ROP/JOP attacks. Intel CET on supported hardware.
+        add_compile_options(-fcf-protection=full)
+    endif()
+    check_cxx_compiler_flag(-fstack-clash-protection HAVE_STACK_CLASH)
+    if (HAVE_STACK_CLASH)
+        # Detects stack clash via unmapped guard pages.
+        add_compile_options(-fstack-clash-protection)
+    endif()
+    # Linker hardening
+    add_link_options(
+        -Wl,-z,relro,-z,now    # full RELRO: GOT read-only after load
+        -Wl,-z,noexecstack     # NX stack
+    )
 endif()
 
 # --- Dependencies ----------------------------------------------------------
@@ -232,6 +277,19 @@ if (ABOBA_BUILD_EXAMPLES)
             target_compile_options(aboba_c_abi_test PRIVATE
                 -Wall -Wextra -Wpedantic
                 -Wno-unused-result)
+        endif()
+
+        # Adversarial / fuzz-style paranoia regression suite. Linked
+        # against the C ABI shared library (same boundary as a real
+        # caller). Compiled as C++ because it uses std::vector for
+        # convenience.
+        add_executable(aboba_adversarial_test examples/adversarial_test.cpp)
+        target_link_libraries(aboba_adversarial_test PRIVATE aboba_c)
+        target_include_directories(aboba_adversarial_test PRIVATE include)
+        if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(aboba_adversarial_test PRIVATE
+                -Wno-conversion -Wno-sign-conversion
+                -Wno-double-promotion -Wno-old-style-cast)
         endif()
     endif()
 

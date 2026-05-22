@@ -15,6 +15,7 @@
 
 #include "aboba/backend.hpp"
 #include "aboba/lowlatency.hpp"
+#include "aboba/paranoia.hpp"
 #include "aboba/pipeline.hpp"
 #include "aboba/voice_character.hpp"
 #include "aboba/voice_config.hpp"
@@ -48,10 +49,18 @@ struct aboba_pipeline_s {
     int  recovery_count = 0;
     static constexpr int kRecoveryBlocksNeeded = 8;
 
+    // PARANOIA: pre-allocated probe buffer used by the bypass-recovery
+    // path. Allocating on the hot audio path is a DoS / glitch vector;
+    // we size this lazily but only ONCE per pipeline, never during
+    // process(). Access only from the calling thread (single-threaded
+    // per-handle, per the ABI contract).
+    std::vector<float> probe_buffer;
+
     // Stats
     std::atomic<std::uint64_t> total_blocks       {0};
     std::atomic<std::uint64_t> bypassed_blocks    {0};
     std::atomic<std::uint64_t> exception_recovers {0};
+    std::atomic<std::uint64_t> rejected_blocks    {0};  // input validation
     std::atomic<float>         last_us            {0.0f};
     std::atomic<float>         p99_us             {0.0f};
 };
@@ -234,6 +243,11 @@ aboba_status aboba_pipeline_create(aboba_backend* backend,
     if (!backend || !backend->backend) return ABOBA_ERR_NULL_POINTER;
     if (!out_pipeline) return ABOBA_ERR_NULL_POINTER;
     *out_pipeline = nullptr;
+    // PARANOIA: reject NaN/Inf/out-of-range sample rates. The pipeline
+    // would crash deep inside the FFT if given garbage here.
+    if (!::aboba::paranoia::valid_sample_rate_strict(sample_rate)) {
+        return ABOBA_ERR_INVALID_ARG;
+    }
     return guard([&]() -> aboba_status {
         aboba::VoicePipelineConfig pc;
         pc.sample_rate = sample_rate;
@@ -251,6 +265,9 @@ aboba_status aboba_pipeline_create_lowlatency(aboba_backend* backend,
     if (!backend || !backend->backend) return ABOBA_ERR_NULL_POINTER;
     if (!out_pipeline) return ABOBA_ERR_NULL_POINTER;
     *out_pipeline = nullptr;
+    if (!::aboba::paranoia::valid_sample_rate_strict(sample_rate)) {
+        return ABOBA_ERR_INVALID_ARG;
+    }
     return guard([&]() -> aboba_status {
         aboba::LowLatencyConfig lc;
         lc.sample_rate = sample_rate;
@@ -274,24 +291,57 @@ void aboba_pipeline_destroy(aboba_pipeline* p) {
 // Pipeline processing
 // =========================================================================
 
+// Hard cap on per-call block size. Anything bigger than this is almost
+// certainly a logic bug (e.g. someone fed in bytes instead of sample count).
+// 1 MiB samples = 21.8 seconds at 48 kHz — well above any realtime block.
+static constexpr std::size_t kMaxBlockSamples = 1024 * 1024;
+
 aboba_status aboba_pipeline_process(aboba_pipeline* p,
                                      const float* input,
                                      float* output,
                                      size_t n_samples) {
-    if (!p)               return ABOBA_ERR_NULL_POINTER;
-    if (!input || !output) return ABOBA_ERR_NULL_POINTER;
-    if (n_samples == 0)   return ABOBA_OK;  // nothing to do
+    // PARANOIA LAYER 1: pointer and size validation. ALL of these must
+    // pass before we touch any buffer. We use the namespace-qualified
+    // helpers so the inlined fast path optimizes well.
+    namespace pn = ::aboba::paranoia;
+
+    if (pn::any_null(p))               return ABOBA_ERR_NULL_POINTER;
+    if (pn::any_null(input, output))   return ABOBA_ERR_NULL_POINTER;
+    if (n_samples == 0)                return ABOBA_OK;
+    if (pn::reject_huge_block(n_samples)) return ABOBA_ERR_BUFFER_SIZE;
+
+    // PARANOIA LAYER 2: aliasing check. in == out is fine (in-place);
+    // partial overlap would smear samples and corrupt processing.
+    if (pn::unsafe_partial_overlap(input, output, n_samples)) {
+        p->rejected_blocks.fetch_add(1, std::memory_order_relaxed);
+        return ABOBA_ERR_INVALID_ARG;
+    }
 
     return guard([&]() -> aboba_status {
         p->total_blocks.fetch_add(1, std::memory_order_relaxed);
 
-        // LowLatency path has its own watchdog; just delegate.
+        // PARANOIA LAYER 3: input NaN/Inf scan. If the caller hands us
+        // garbage, we don't propagate it through internal IIR filters
+        // (which would poison the pipeline state for many subsequent
+        // blocks). Emit silence and count as a rejection.
+        if (ABOBA_UNLIKELY(!pn::block_is_finite(input, n_samples))) {
+            p->exception_recovers.fetch_add(1, std::memory_order_relaxed);
+            std::memset(output, 0, n_samples * sizeof(float));
+            return ABOBA_OK;
+        }
+
+        // PARANOIA LAYER 4: RAII output sanitizer. Even if every internal
+        // stage misbehaves, the output buffer is scrubbed of NaN/Inf and
+        // clamped on scope exit.
+        pn::ScopedOutputSanitizer scrub_guard(output, n_samples, 4.0f);
+
+        // ---- LowLatency path -----------------------------------------
         if (p->lowlatency) {
             try {
                 p->lowlatency->process(input, output, n_samples);
             } catch (...) {
                 p->exception_recovers.fetch_add(1, std::memory_order_relaxed);
-                std::memcpy(output, input, n_samples * sizeof(float));
+                pn::emergency_passthrough(input, output, n_samples);
                 return ABOBA_OK;
             }
             auto s = p->lowlatency->stats();
@@ -301,20 +351,32 @@ aboba_status aboba_pipeline_process(aboba_pipeline* p,
             if (s.currently_bypassed) {
                 p->bypassed_blocks.fetch_add(1, std::memory_order_relaxed);
             }
+            // LAYER 5: hard limiter — speaker safety, last line.
+            pn::hard_limit_block(output, n_samples, 1.0f);
             return ABOBA_OK;
         }
 
         if (!p->normal) return ABOBA_ERR_NULL_POINTER;
 
-        // Normal pipeline path: budget guard around the call.
+        // ---- Normal pipeline: bypass-mode probe path -----------------
         if (p->currently_bypassed.load(std::memory_order_relaxed)) {
+            // Default action: passthrough.
             std::memcpy(output, input, n_samples * sizeof(float));
             p->bypassed_blocks.fetch_add(1, std::memory_order_relaxed);
-            // Probe to see if we can recover budget headroom.
+
+            // Probe: try full processing into pre-allocated buffer to
+            // measure current cost. NO ALLOCATION on the hot path —
+            // we lazily grow the probe buffer to fit `n_samples`, but
+            // only when bypassed (which is by definition not the hot
+            // path). The probe itself is exception-guarded.
             try {
-                std::vector<float> probe(n_samples);
+                if (p->probe_buffer.size() < n_samples) {
+                    // Resize defensively. If this throws bad_alloc we
+                    // just stay in bypass (caught below).
+                    p->probe_buffer.resize(n_samples);
+                }
                 const auto t0 = std::chrono::steady_clock::now();
-                p->normal->process(input, probe.data(), n_samples);
+                p->normal->process(input, p->probe_buffer.data(), n_samples);
                 const auto t1 = std::chrono::steady_clock::now();
                 const auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
                 p->last_us.store(static_cast<float>(us));
@@ -322,25 +384,36 @@ aboba_status aboba_pipeline_process(aboba_pipeline* p,
                     if (++p->recovery_count >= aboba_pipeline_s::kRecoveryBlocksNeeded) {
                         p->currently_bypassed.store(false);
                         p->recovery_count = 0;
-                        std::memcpy(output, probe.data(), n_samples * sizeof(float));
+                        // Adopt probe result for THIS block since we
+                        // computed it in budget anyway.
+                        std::memcpy(output, p->probe_buffer.data(),
+                                     n_samples * sizeof(float));
                     }
                 } else {
                     p->recovery_count = 0;
                 }
+            } catch (const std::bad_alloc&) {
+                // OOM during probe buffer resize. Stay in bypass; we'll
+                // try again on the next block when there might be more
+                // memory available.
+                p->exception_recovers.fetch_add(1, std::memory_order_relaxed);
+                p->recovery_count = 0;
             } catch (...) {
                 p->exception_recovers.fetch_add(1, std::memory_order_relaxed);
                 p->recovery_count = 0;
             }
+            // Scrub before returning (output may have probe data)
             return ABOBA_OK;
         }
 
-        // Normal path
+        // ---- Normal pipeline: standard processing path ---------------
         const auto t0 = std::chrono::steady_clock::now();
         try {
             p->normal->process(input, output, n_samples);
         } catch (...) {
+            // Any C++ exception during processing -> passthrough.
             p->exception_recovers.fetch_add(1, std::memory_order_relaxed);
-            std::memcpy(output, input, n_samples * sizeof(float));
+            pn::emergency_passthrough(input, output, n_samples);
             return ABOBA_OK;
         }
         const auto t1 = std::chrono::steady_clock::now();
@@ -360,6 +433,9 @@ aboba_status aboba_pipeline_process(aboba_pipeline* p,
                 p->recovery_count = 0;
             }
         }
+        // LAYER 5: hard limiter — speaker safety, even if the pipeline's
+        // own internal limiter is somehow misconfigured.
+        pn::hard_limit_block(output, n_samples, 1.0f);
         return ABOBA_OK;
     });
 }
@@ -381,6 +457,9 @@ aboba_status aboba_pipeline_reset(aboba_pipeline* p) {
 
 aboba_status aboba_pipeline_set_pitch_semitones(aboba_pipeline* p, float st) {
     if (!p) return ABOBA_ERR_NULL_POINTER;
+    // Clamp at ABI boundary. Insane values (NaN, +/-1e30) would propagate
+    // and could cause subsequent FFT calls to produce inf/nan output.
+    st = ::aboba::paranoia::clamp_to(st, -48.0f, 48.0f);
     return guard([&]() -> aboba_status {
         if (p->normal)     p->normal->set_pitch_semitones(st);
         if (p->lowlatency) p->lowlatency->set_pitch_semitones(st);
@@ -390,13 +469,12 @@ aboba_status aboba_pipeline_set_pitch_semitones(aboba_pipeline* p, float st) {
 
 aboba_status aboba_pipeline_set_formant_semitones(aboba_pipeline* p, float st) {
     if (!p) return ABOBA_ERR_NULL_POINTER;
+    st = ::aboba::paranoia::clamp_to(st, -24.0f, 24.0f);
     return guard([&]() -> aboba_status {
         if (p->normal) {
             p->normal->set_formant_semitones(st);
             return ABOBA_OK;
         }
-        // LowLatency has no formant control — silently ignore (it has no
-        // formant-preserving stage to control).
         return ABOBA_OK;
     });
 }
@@ -457,6 +535,8 @@ aboba_status aboba_pipeline_set_autotune_scale(aboba_pipeline* p,
 aboba_status aboba_pipeline_set_autotune_strength(aboba_pipeline* p, float s) {
     if (!p) return ABOBA_ERR_NULL_POINTER;
     if (!p->normal) return ABOBA_ERR_NOT_IMPLEMENTED;
+    // PARANOIA: strength is a 0..1 mix coefficient
+    s = ::aboba::paranoia::clamp01(s);
     return guard([&]() -> aboba_status {
         p->normal->set_autotune_strength(s);
         return ABOBA_OK;
@@ -466,6 +546,9 @@ aboba_status aboba_pipeline_set_autotune_strength(aboba_pipeline* p, float s) {
 aboba_status aboba_pipeline_set_autotune_glide_ms(aboba_pipeline* p, float ms) {
     if (!p) return ABOBA_ERR_NULL_POINTER;
     if (!p->normal) return ABOBA_ERR_NOT_IMPLEMENTED;
+    // PARANOIA: glide in [0, 1000] ms. Negative would cause unstable
+    // exponential; huge would freeze pitch contour.
+    ms = ::aboba::paranoia::clamp_to(ms, 0.0f, 1000.0f);
     return guard([&]() -> aboba_status {
         p->normal->set_autotune_glide_ms(ms);
         return ABOBA_OK;
@@ -493,6 +576,9 @@ int aboba_pipeline_get_reverb_enabled(const aboba_pipeline* p) {
 aboba_status aboba_pipeline_set_reverb_room_size(aboba_pipeline* p, float v) {
     if (!p) return ABOBA_ERR_NULL_POINTER;
     if (!p->normal) return ABOBA_ERR_NOT_IMPLEMENTED;
+    // PARANOIA: room_size must be in [0, 1]. NaN/Inf would propagate to
+    // the comb filter feedback coefficient and produce unbounded output.
+    v = ::aboba::paranoia::clamp01(v);
     return guard([&]() -> aboba_status {
         p->normal->set_reverb_room_size(v); return ABOBA_OK;
     });
@@ -501,6 +587,7 @@ aboba_status aboba_pipeline_set_reverb_room_size(aboba_pipeline* p, float v) {
 aboba_status aboba_pipeline_set_reverb_damping(aboba_pipeline* p, float v) {
     if (!p) return ABOBA_ERR_NULL_POINTER;
     if (!p->normal) return ABOBA_ERR_NOT_IMPLEMENTED;
+    v = ::aboba::paranoia::clamp01(v);
     return guard([&]() -> aboba_status {
         p->normal->set_reverb_damping(v); return ABOBA_OK;
     });
@@ -509,6 +596,7 @@ aboba_status aboba_pipeline_set_reverb_damping(aboba_pipeline* p, float v) {
 aboba_status aboba_pipeline_set_reverb_wet(aboba_pipeline* p, float v) {
     if (!p) return ABOBA_ERR_NULL_POINTER;
     if (!p->normal) return ABOBA_ERR_NOT_IMPLEMENTED;
+    v = ::aboba::paranoia::clamp01(v);
     return guard([&]() -> aboba_status {
         p->normal->set_reverb_wet(v); return ABOBA_OK;
     });
@@ -576,6 +664,9 @@ size_t aboba_pipeline_latency_samples(const aboba_pipeline* p) {
 aboba_status aboba_config_load_file(const char* path, aboba_config** out_config) {
     if (!path || !out_config) return ABOBA_ERR_NULL_POINTER;
     *out_config = nullptr;
+    // PARANOIA: bound the path length. A multi-megabyte path is either
+    // attack or bug; refuse before passing to fopen().
+    if (::aboba::paranoia::reject_string(path)) return ABOBA_ERR_INVALID_ARG;
     return guard([&]() -> aboba_status {
         auto r = aboba::load_voice_config(path);
         if (!r.ok()) {
@@ -600,6 +691,10 @@ aboba_status aboba_config_parse_string(const char* toml_text,
                                         aboba_config** out_config) {
     if (!toml_text || !out_config) return ABOBA_ERR_NULL_POINTER;
     *out_config = nullptr;
+    // PARANOIA: bound TOML body to 16 MiB. Anything bigger is a memory
+    // exhaustion attempt; we refuse before parsing.
+    if (::aboba::paranoia::reject_string(toml_text, 16u * 1024u * 1024u))
+        return ABOBA_ERR_INVALID_ARG;
     return guard([&]() -> aboba_status {
         auto r = aboba::parse_voice_config(toml_text);
         if (!r.ok()) {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "aboba/lowlatency.hpp"
+#include "aboba/paranoia.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -46,6 +47,14 @@ LowLatencyPipeline::LowLatencyPipeline(LowLatencyConfig cfg, Backend* backend)
     out_buf_.assign(cfg_.window_size * 4, 0.0f);
     out_read_  = 0;
     out_write_ = cfg_.window_size;  // pre-fill latency
+
+    // Pre-allocate scratch buffers. We pick a reasonable starting size;
+    // process() will grow these if the caller passes larger blocks (only
+    // happens once per session). After that, no audio-path allocation.
+    // 8192 covers all typical game-engine block sizes (1-2048 samples)
+    // with 4x headroom.
+    sola_input_scratch_.assign(8192, 0.0f);
+    probe_output_scratch_.assign(8192, 0.0f);
 }
 
 LowLatencyPipeline::~LowLatencyPipeline() = default;
@@ -174,16 +183,18 @@ void LowLatencyPipeline::process_block_inner(const float* in, float* out,
     if (cfg_.enable_highpass) hp_.process_block(out, out, n);
     if (cfg_.enable_gate)     gate_.process_block(out, out, n);
 
-    // 2. Pitch shift via SOLA (in-place — read from `out`, write to `out`).
-    //    Because SOLA reads from internal history (not `out` directly), it's
-    //    safe to alias input and output here.
+    // 2. Pitch shift via SOLA. Need a temporary because sola_pitch_shift
+    //    reads `in[i]` for the history append BEFORE writing `out[i]`;
+    //    with in==out that would contaminate the history. We use a pre-
+    //    allocated scratch buffer; only resize if the caller passed a
+    //    block bigger than what we pre-allocated (extremely rare).
     {
-        // Need a temporary because sola_pitch_shift reads `in[i]` for the
-        // history append BEFORE writing `out[i]`. With in==out that would
-        // contaminate the history. Use stack buffer if small, heap else.
-        // For typical game block sizes (64-1024) the stack copy is fine.
-        std::vector<float> tmp(out, out + n);
-        sola_pitch_shift(tmp.data(), out, n);
+        if (ABOBA_UNLIKELY(sola_input_scratch_.size() < n)) {
+            // One-time growth. After this, no allocations in steady state.
+            sola_input_scratch_.resize(n);
+        }
+        std::memcpy(sola_input_scratch_.data(), out, n * sizeof(float));
+        sola_pitch_shift(sola_input_scratch_.data(), out, n);
     }
 
     // 3. Limiter (last line of defense — sample-by-sample)
@@ -212,8 +223,11 @@ void LowLatencyPipeline::process(const float* input, float* output,
         // we'll exit bypass.
         const auto t0 = std::chrono::steady_clock::now();
         try {
-            std::vector<float> probe_out(n);
-            process_block_inner(input, probe_out.data(), n);
+            if (ABOBA_UNLIKELY(probe_output_scratch_.size() < n)) {
+                probe_output_scratch_.resize(n);
+            }
+            float* probe_out = probe_output_scratch_.data();
+            process_block_inner(input, probe_out, n);
             const auto t1 = std::chrono::steady_clock::now();
             const auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
             stat_last_us_.store(static_cast<float>(us));
@@ -223,7 +237,7 @@ void LowLatencyPipeline::process(const float* input, float* output,
                     recovery_count_ = 0;
                     // Adopt the probe result for THIS block since we
                     // managed to compute it in budget.
-                    std::memcpy(output, probe_out.data(), n * sizeof(float));
+                    std::memcpy(output, probe_out, n * sizeof(float));
                 }
             } else {
                 recovery_count_ = 0;
